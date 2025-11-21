@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>SpeedTrap AI Mobile</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- TensorFlow.js & COCO-SSD -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.10.0/dist/tf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.2"></script>
+
+    <!-- React & ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    
+    <!-- Babel (for JSX) -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <style>
+        body { background-color: #0f172a; color: white; touch-action: manipulation; }
+        .safe-area-bottom { padding-bottom: env(safe-area-inset-bottom); }
+        input[type=range] { accent-color: #22c55e; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useRef, useEffect, useCallback } = React;
+
+        // --- Icons (Inline SVGs to avoid dependencies) ---
+        const Icon = ({ children, className, onClick }) => (
+            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} onClick={onClick} style={{cursor: onClick ? 'pointer' : 'default'}}>
+                {children}
+            </svg>
+        );
+        const CameraIcon = () => <Icon><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></Icon>;
+        const UploadIcon = () => <Icon><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></Icon>;
+        const PlayIcon = () => <Icon><polygon points="5 3 19 12 5 21 5 3"/></Icon>;
+        const PauseIcon = () => <Icon><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></Icon>;
+        const SettingsIcon = () => <Icon><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.1a2 2 0 0 1-1-1.72v-.51a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></Icon>;
+        const ActivityIcon = () => <Icon><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></Icon>;
+        const AlertIcon = () => <Icon><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></Icon>;
+        const BugIcon = () => <Icon><rect width="8" height="14" x="8" y="6" rx="4"/><path d="m19 7-3 2"/><path d="m5 7 3 2"/><path d="m19 19-3-2"/><path d="m5 19 3-2"/><path d="M20 13h-4"/><path d="M4 13h4"/><path d="m10 4 1 2"/><path d="m14 4-1 2"/></Icon>;
+        const DownloadIcon = () => <Icon><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></Icon>;
+
+        /**
+         * ------------------------------------------------------------------
+         * TRACKING LOGIC
+         * ------------------------------------------------------------------
+         */
+        class VehicleTracker {
+            constructor() {
+                this.trackedObjects = [];
+                this.nextId = 1;
+                this.maxMissingFrames = 10; 
+                this.matchDistanceThreshold = 150;
+            }
+
+            clearActiveObjects() {
+                this.trackedObjects = [];
+            }
+
+            update(detections, frameTime, fieldWidthFt, videoWidth, isDebugMode) {
+                const validClasses = ['car', 'truck', 'bus', 'motorcycle'];
+                const relevantDetections = isDebugMode 
+                    ? detections 
+                    : detections.filter(d => validClasses.includes(d.class));
+                
+                const currentFrameObjects = relevantDetections.map(d => {
+                    const [x, y, w, h] = d.bbox;
+                    return {
+                        centerX: x + w / 2,
+                        centerY: y + h / 2,
+                        bbox: d.bbox,
+                        area: w * h,
+                        class: d.class
+                    };
+                });
+
+                const matchedIndices = new Set();
+                
+                this.trackedObjects.forEach(obj => {
+                    let closestDist = Infinity;
+                    let bestMatchIndex = -1;
+
+                    currentFrameObjects.forEach((det, index) => {
+                        if (matchedIndices.has(index)) return;
+                        const dist = Math.hypot(det.centerX - obj.x, det.centerY - obj.y);
+                        if (dist < this.matchDistanceThreshold && dist < closestDist) {
+                        closestDist = dist;
+                        bestMatchIndex = index;
+                        }
+                    });
+
+                    if (bestMatchIndex !== -1) {
+                        const match = currentFrameObjects[bestMatchIndex];
+                        matchedIndices.add(bestMatchIndex);
+                        
+                        const deltaPixels = Math.abs(match.centerX - obj.x);
+                        const deltaSeconds = (frameTime - obj.lastSeen) / 1000;
+                        
+                        let speedMph = 0;
+                        if (deltaSeconds > 0 && videoWidth > 0) {
+                            const fractionOfScreen = deltaPixels / videoWidth;
+                            const feetTraveled = fractionOfScreen * fieldWidthFt;
+                            const feetPerSecond = feetTraveled / deltaSeconds;
+                            speedMph = (feetPerSecond * 3600) / 5280;
+                        }
+
+                        if (deltaSeconds > 0 && deltaPixels > 1) {
+                            obj.speedSamples.push(speedMph);
+                            if (obj.speedSamples.length > 10) obj.speedSamples.shift(); 
+                        }
+
+                        obj.x = match.centerX;
+                        obj.y = match.centerY;
+                        obj.width = match.bbox[2];
+                        obj.height = match.bbox[3];
+                        obj.lastSeen = frameTime;
+                        obj.missingFrames = 0;
+                        obj.class = match.class;
+                        
+                        if (obj.history.length > 0) {
+                            obj.direction = obj.x > obj.history[obj.history.length - 1].x ? 'R' : 'L';
+                        }
+                        
+                        obj.history.push({ x: obj.x, y: obj.y, t: frameTime });
+
+                    } else {
+                        obj.missingFrames++;
+                    }
+                });
+
+                currentFrameObjects.forEach((det, index) => {
+                    if (!matchedIndices.has(index)) {
+                        this.trackedObjects.push({
+                            id: this.nextId++,
+                            x: det.centerX,
+                            y: det.centerY,
+                            width: det.bbox[2],
+                            height: det.bbox[3],
+                            firstSeen: frameTime,
+                            lastSeen: frameTime,
+                            history: [{ x: det.centerX, y: det.centerY, t: frameTime }],
+                            speedSamples: [],
+                            missingFrames: 0,
+                            class: det.class,
+                            locked: false, 
+                        });
+                    }
+                });
+
+                this.trackedObjects = this.trackedObjects.filter(obj => obj.missingFrames < this.maxMissingFrames);
+                return this.trackedObjects;
+            }
+        }
+
+        /**
+         * ------------------------------------------------------------------
+         * REACT APP
+         * ------------------------------------------------------------------
+         */
+        function SpeedTrapApp() {
+            const videoRef = useRef(null);
+            const canvasRef = useRef(null);
+            const requestRef = useRef(null);
+            const lastVideoTimeRef = useRef(0);
+            
+            const [model, setModel] = useState(null);
+            const [isVideoReady, setIsVideoReady] = useState(false);
+            const [isProcessing, setIsProcessing] = useState(false);
+            const [fieldWidth, setFieldWidth] = useState(75); 
+            const [logs, setLogs] = useState([]);
+            const [loadingMsg, setLoadingMsg] = useState("Loading AI...");
+            const [showDebug, setShowDebug] = useState(false); 
+            const [detectionCount, setDetectionCount] = useState(0); 
+            
+            const tracker = useRef(new VehicleTracker());
+
+            useEffect(() => {
+                async function initTF() {
+                    try {
+                        // Wait for scripts to load if they haven't
+                        if (!window.cocoSsd) {
+                            setTimeout(initTF, 500);
+                            return;
+                        }
+                        const loadedModel = await window.cocoSsd.load({ base: 'mobilenet_v2' });
+                        setModel(loadedModel);
+                        setLoadingMsg("");
+                    } catch (err) {
+                        setLoadingMsg("Error loading AI.");
+                        console.error(err);
+                    }
+                }
+                initTF();
+            }, []);
+
+            const startCamera = async () => {
+                if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+                    try {
+                        const stream = await navigator.mediaDevices.getUserMedia({
+                            audio: false,
+                            video: { facingMode: 'environment' }
+                        });
+                        if (videoRef.current) {
+                            videoRef.current.srcObject = stream;
+                            videoRef.current.onloadedmetadata = () => {
+                                videoRef.current.play();
+                                setIsVideoReady(true);
+                            };
+                        }
+                    } catch (e) {
+                        alert("Could not access camera. Ensure you are on HTTPS.");
+                    }
+                }
+            };
+
+            const handleFileUpload = (event) => {
+                const file = event.target.files[0];
+                if (file) {
+                    const url = URL.createObjectURL(file);
+                    if (videoRef.current) {
+                        videoRef.current.srcObject = null;
+                        videoRef.current.src = url;
+                        videoRef.current.load();
+                    }
+                }
+            };
+
+            const handleVideoLoaded = () => {
+                setIsVideoReady(true);
+            };
+
+            const downloadCSV = () => {
+                if (logs.length === 0) return;
+                const headers = ["ID", "Time", "Class", "Speed (MPH)"];
+                const rows = logs.map(log => [log.id, log.time, log.class, log.speed]);
+                let csvContent = "data:text/csv;charset=utf-8," + headers.join(",") + "\n" + rows.map(e => e.join(",")).join("\n");
+                const encodedUri = encodeURI(csvContent);
+                const link = document.createElement("a");
+                link.setAttribute("href", encodedUri);
+                link.setAttribute("download", "speed_trap_data.csv");
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            };
+
+            const detectFrame = useCallback(async () => {
+                if (!model || !videoRef.current || !canvasRef.current) return;
+                
+                const video = videoRef.current;
+                if (video.paused || video.ended) return;
+
+                // Loop Detection
+                if (video.currentTime < lastVideoTimeRef.current - 0.5) {
+                    tracker.current.clearActiveObjects();
+                }
+                lastVideoTimeRef.current = video.currentTime;
+
+                const canvas = canvasRef.current;
+                const ctx = canvas.getContext('2d');
+
+                if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                }
+
+                const predictions = await model.detect(video, 20, 0.15); 
+                setDetectionCount(predictions.length);
+
+                const timestamp = performance.now();
+                const trackedObjects = tracker.current.update(predictions, timestamp, fieldWidth, video.videoWidth, showDebug);
+
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                
+                ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.moveTo(0, canvas.height - 20);
+                ctx.lineTo(canvas.width, canvas.height - 20);
+                ctx.stroke();
+                ctx.fillStyle = 'rgba(255,255,255, 0.8)';
+                ctx.font = '14px sans-serif';
+                ctx.fillText(`◄―― Visual Field: ${fieldWidth} ft ――►`, canvas.width / 2 - 80, canvas.height - 30);
+
+                if (predictions.length === 0 && isProcessing) {
+                    ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+                    ctx.fillRect(10, 10, 200, 30);
+                    ctx.fillStyle = 'white';
+                    ctx.font = '14px sans-serif';
+                    ctx.fillText("Scanning... (No objects)", 20, 30);
+                }
+
+                trackedObjects.forEach(obj => {
+                    const validSamples = obj.speedSamples.filter(s => s > 1 && s < 120); 
+                    const avgSpeed = validSamples.length > 0 ? (validSamples.reduce((a, b) => a + b, 0) / validSamples.length).toFixed(1) : '...';
+                    const opacity = 1 - (obj.missingFrames / 10);
+                    const color = obj.locked ? '#00FF00' : (obj.missingFrames > 0 ? `rgba(255, 165, 0, ${opacity})` : `rgba(0, 255, 0, ${opacity})`);
+
+                    ctx.strokeStyle = color;
+                    ctx.lineWidth = 3;
+                    ctx.strokeRect(obj.x - obj.width / 2, obj.y - obj.height / 2, obj.width, obj.height);
+
+                    ctx.fillStyle = color;
+                    ctx.font = 'bold 24px monospace';
+                    const label = `#${obj.id} ${showDebug ? obj.class : ''} ${avgSpeed} mph`;
+                    ctx.fillText(label, obj.x - obj.width / 2, obj.y - obj.height / 2 - 10);
+
+                    if (obj.locked) {
+                        ctx.fillStyle = '#00FF00';
+                        ctx.fillRect(obj.x - obj.width/2, obj.y - obj.height/2 - 35, 80, 25);
+                        ctx.fillStyle = 'black';
+                        ctx.font = 'bold 14px sans-serif';
+                        ctx.fillText("LOGGED", obj.x - obj.width/2 + 5, obj.y - obj.height/2 - 18);
+                    }
+
+                    if (validSamples.length > 4 && !obj.locked) {
+                        obj.locked = true; 
+                        setLogs(prev => [{
+                            id: obj.id,
+                            speed: avgSpeed,
+                            class: obj.class,
+                            time: new Date().toLocaleTimeString()
+                        }, ...prev]);
+                    }
+                });
+
+                requestRef.current = requestAnimationFrame(detectFrame);
+            }, [model, fieldWidth, showDebug, isProcessing]);
+
+            const toggleProcessing = async () => {
+                if (isProcessing) {
+                    setIsProcessing(false);
+                    videoRef.current.pause();
+                    cancelAnimationFrame(requestRef.current);
+                } else {
+                    try {
+                        await videoRef.current.play();
+                        setIsProcessing(true);
+                        requestRef.current = requestAnimationFrame(detectFrame);
+                    } catch (err) {
+                        alert("Video play error: " + err.message);
+                    }
+                }
+            };
+
+            return (
+                <div className="flex flex-col h-screen bg-slate-900 text-white font-sans">
+                    <header className="p-4 bg-slate-800 border-b border-slate-700 flex justify-between items-center">
+                        <div className="flex items-center space-x-2">
+                            <ActivityIcon className="text-green-400" />
+                            <h1 className="text-xl font-bold">SpeedTrap AI</h1>
+                        </div>
+                        <div className="flex flex-col items-end">
+                            {loadingMsg && <span className="text-yellow-400 text-xs animate-pulse">{loadingMsg}</span>}
+                            {isProcessing && <span className="text-blue-300 text-xs font-mono mt-1">AI Sees: {detectionCount}</span>}
+                        </div>
+                    </header>
+
+                    <div className="flex-grow relative bg-black overflow-hidden flex justify-center items-center">
+                        {!isVideoReady && !loadingMsg && (
+                        <div className="text-center p-6">
+                            <p className="mb-4 text-gray-400">Select source</p>
+                            <div className="flex space-x-4 justify-center">
+                                <button onClick={startCamera} className="flex items-center px-6 py-3 bg-blue-600 rounded-lg hover:bg-blue-700 transition">
+                                    <CameraIcon className="mr-2" /> Live Cam
+                                </button>
+                                <label className="flex items-center px-6 py-3 bg-slate-700 rounded-lg hover:bg-slate-600 transition cursor-pointer">
+                                    <UploadIcon className="mr-2" /> Upload
+                                    <input type="file" accept="video/*" onChange={handleFileUpload} className="hidden" />
+                                </label>
+                            </div>
+                        </div>
+                        )}
+                        
+                        <video ref={videoRef} className={`max-w-full max-h-full object-contain ${!isVideoReady || isProcessing ? 'hidden' : 'block'}`} playsInline muted controls={!isProcessing} loop onLoadedMetadata={handleVideoLoaded} />
+                        <canvas ref={canvasRef} className={`max-w-full max-h-full object-contain absolute top-0 left-0 ${!isProcessing ? 'hidden' : ''}`} style={{ margin: 'auto', top: 0, bottom: 0, left: 0, right: 0 }} />
+                    </div>
+
+                    <div className="bg-slate-800 border-t border-slate-700 p-4 pb-8 safe-area-bottom">
+                        <div className="flex items-center justify-between mb-4">
+                        <div className="flex flex-col w-full mr-4">
+                            <label className="text-xs text-gray-400 mb-1 flex items-center">
+                                <SettingsIcon className="mr-1" /> Field Width (Feet)
+                            </label>
+                            <input type="range" min="20" max="200" value={fieldWidth} onChange={(e) => setFieldWidth(parseInt(e.target.value))} className="w-full h-2 bg-slate-600 rounded-lg appearance-none cursor-pointer" />
+                            <div className="text-right text-xs text-green-400 mt-1">{fieldWidth} ft</div>
+                        </div>
+                        
+                        <div className="flex items-center space-x-3">
+                            <button onClick={() => setShowDebug(!showDebug)} className={`p-3 rounded-full transition-all border ${showDebug ? 'bg-red-900 border-red-500 text-white' : 'bg-slate-700 border-slate-600 text-gray-400'}`}>
+                                <BugIcon />
+                            </button>
+
+                            <button onClick={toggleProcessing} disabled={!isVideoReady} className={`p-4 rounded-full shadow-lg flex-shrink-0 ${isProcessing ? 'bg-red-500 hover:bg-red-600' : 'bg-green-500 hover:bg-green-600'} disabled:opacity-50 disabled:cursor-not-allowed transition-all`}>
+                                {isProcessing ? <PauseIcon /> : <PlayIcon />}
+                            </button>
+                        </div>
+                        </div>
+
+                        <div className="flex space-x-4 h-32">
+                            <div className="bg-slate-900 rounded-lg p-3 flex-grow overflow-y-auto border border-slate-700">
+                                <div className="flex justify-between items-center mb-2 sticky top-0 bg-slate-900">
+                                    <div className="flex items-center">
+                                        <h3 className="text-xs font-bold text-gray-500 uppercase mr-2">Log ({logs.length})</h3>
+                                        <button onClick={downloadCSV} className="text-blue-400 hover:text-blue-300 transition-colors">
+                                            <DownloadIcon />
+                                        </button>
+                                    </div>
+                                </div>
+                                {logs.length === 0 ? (
+                                    <div className="text-gray-600 text-sm italic text-center mt-8">No vehicles logged</div>
+                                ) : (
+                                    <table className="w-full text-sm text-left">
+                                        <thead>
+                                            <tr className="text-gray-500 border-b border-slate-800"><th className="pb-1">Time</th><th className="pb-1">ID</th><th className="pb-1 text-right">Speed</th></tr>
+                                        </thead>
+                                        <tbody>
+                                            {logs.map((log, i) => (
+                                                <tr key={i} className="border-b border-slate-800 last:border-0">
+                                                    <td className="py-2 text-gray-400">{log.time}</td>
+                                                    <td className="py-2 text-blue-400 font-mono">#{log.id}</td>
+                                                    <td className="py-2 text-right font-bold text-green-400">{log.speed}</td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<SpeedTrapApp />);
+    </script>
+</body>
+</html>
