@@ -49,7 +49,7 @@
 
         /**
          * ------------------------------------------------------------------
-         * TRACKING LOGIC
+         * TRACKING LOGIC - SLIDING WINDOW UPDATE
          * ------------------------------------------------------------------
          */
         class VehicleTracker {
@@ -100,22 +100,38 @@
                         const match = currentFrameObjects[bestMatchIndex];
                         matchedIndices.add(bestMatchIndex);
                         
-                        const deltaPixels = Math.abs(match.centerX - obj.x);
-                        const deltaSeconds = (frameTime - obj.lastSeen) / 1000;
+                        // 1. PUSH HISTORY POINT FIRST (Position at Time T)
+                        // We store history for calculation *before* we update the main x/y
+                        obj.history.push({ x: match.centerX, y: match.centerY, t: frameTime });
                         
+                        // Keep last ~30 frames (approx 1 second of history)
+                        if (obj.history.length > 30) obj.history.shift();
+
+                        // 2. CALCULATE SPEED USING SLIDING WINDOW
+                        // Instead of comparing to the *immediate* last frame (noisy),
+                        // we compare to a frame ~15 frames ago (or as far back as we have).
+                        const lookbackIndex = Math.max(0, obj.history.length - 15);
+                        const startPoint = obj.history[lookbackIndex];
+                        const endPoint = obj.history[obj.history.length - 1];
+
+                        const distPixels = Math.abs(endPoint.x - startPoint.x);
+                        const timeDiffSeconds = (endPoint.t - startPoint.t) / 1000;
+
                         let speedMph = 0;
-                        if (deltaSeconds > 0 && videoWidth > 0) {
-                            const fractionOfScreen = deltaPixels / videoWidth;
+                        
+                        // Only calculate if we have a decent time delta (> 0.2s) to avoid division by zero spikes
+                        if (timeDiffSeconds > 0.2 && videoWidth > 0) {
+                            const fractionOfScreen = distPixels / videoWidth;
                             const feetTraveled = fractionOfScreen * fieldWidthFt;
-                            const feetPerSecond = feetTraveled / deltaSeconds;
+                            const feetPerSecond = feetTraveled / timeDiffSeconds;
                             speedMph = (feetPerSecond * 3600) / 5280;
-                        }
-
-                        if (deltaSeconds > 0 && deltaPixels > 1) {
+                            
+                            // Valid Sample? Push it.
                             obj.speedSamples.push(speedMph);
-                            if (obj.speedSamples.length > 10) obj.speedSamples.shift(); 
+                            if (obj.speedSamples.length > 20) obj.speedSamples.shift();
                         }
 
+                        // 3. Update Current State
                         obj.x = match.centerX;
                         obj.y = match.centerY;
                         obj.width = match.bbox[2];
@@ -124,11 +140,9 @@
                         obj.missingFrames = 0;
                         obj.class = match.class;
                         
-                        if (obj.history.length > 0) {
-                            obj.direction = obj.x > obj.history[obj.history.length - 1].x ? 'R' : 'L';
+                        if (obj.history.length > 1) {
+                            obj.direction = obj.x > obj.history[obj.history.length - 2].x ? 'R' : 'L';
                         }
-                        
-                        obj.history.push({ x: obj.x, y: obj.y, t: frameTime });
 
                     } else {
                         obj.missingFrames++;
