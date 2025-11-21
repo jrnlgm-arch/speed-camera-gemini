@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>SpeedTrap AI Mobile</title>
+    <title>SpeedTrap AI Mobile - 0.5s Average</title>
     
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
@@ -49,7 +49,7 @@
 
         /**
          * ------------------------------------------------------------------
-         * TRACKING LOGIC - SLIDING WINDOW UPDATE
+         * TRACKING LOGIC - TRIPLE METRIC (Smoothed, 0.5s Absolute, 1.0s Absolute)
          * ------------------------------------------------------------------
          */
         class VehicleTracker {
@@ -62,6 +62,24 @@
 
             clearActiveObjects() {
                 this.trackedObjects = [];
+            }
+
+            // Helper to find history point close to a target time
+            findHistoryPoint(history, targetTime, toleranceMs) {
+                return history.find(h => Math.abs(h.t - targetTime) < toleranceMs);
+            }
+
+            calculateSpeed(startPoint, endPoint, videoWidth, fieldWidthFt) {
+                const distPixels = Math.abs(endPoint.x - startPoint.x);
+                const timeDiffSeconds = (endPoint.t - startPoint.t) / 1000;
+
+                if (timeDiffSeconds > 0.1 && videoWidth > 0) {
+                    const fractionOfScreen = distPixels / videoWidth;
+                    const feetTraveled = fractionOfScreen * fieldWidthFt;
+                    const feetPerSecond = feetTraveled / timeDiffSeconds;
+                    return (feetPerSecond * 3600) / 5280; // MPH
+                }
+                return 0;
             }
 
             update(detections, frameTime, fieldWidthFt, videoWidth, isDebugMode) {
@@ -82,7 +100,8 @@
                 });
 
                 const matchedIndices = new Set();
-                
+                const currentEnd = { t: frameTime };
+
                 this.trackedObjects.forEach(obj => {
                     let closestDist = Infinity;
                     let bestMatchIndex = -1;
@@ -98,40 +117,41 @@
 
                     if (bestMatchIndex !== -1) {
                         const match = currentFrameObjects[bestMatchIndex];
+                        currentEnd.x = match.centerX;
+                        
                         matchedIndices.add(bestMatchIndex);
                         
-                        // 1. PUSH HISTORY POINT FIRST (Position at Time T)
-                        // We store history for calculation *before* we update the main x/y
+                        // 1. Store History (Keep enough for 1 sec lookback + tolerance)
                         obj.history.push({ x: match.centerX, y: match.centerY, t: frameTime });
-                        
-                        // Keep last ~30 frames (approx 1 second of history)
-                        if (obj.history.length > 30) obj.history.shift();
+                        if (obj.history.length > 60) obj.history.shift(); // 60 frames @ 30fps is 2s
 
-                        // 2. CALCULATE SPEED USING SLIDING WINDOW
-                        // Instead of comparing to the *immediate* last frame (noisy),
-                        // we compare to a frame ~15 frames ago (or as far back as we have).
-                        const lookbackIndex = Math.max(0, obj.history.length - 15);
-                        const startPoint = obj.history[lookbackIndex];
-                        const endPoint = obj.history[obj.history.length - 1];
+                        // 2. METRIC A: Sliding Window Speed (Smoothed ~0.5s Lookback)
+                        const lookbackIndex = Math.max(0, obj.history.length - 15); // ~0.5s at 30fps
+                        const startPointSmooth = obj.history[lookbackIndex];
+                        const smoothSpeed = this.calculateSpeed(startPointSmooth, currentEnd, videoWidth, fieldWidthFt);
 
-                        const distPixels = Math.abs(endPoint.x - startPoint.x);
-                        const timeDiffSeconds = (endPoint.t - startPoint.t) / 1000;
-
-                        let speedMph = 0;
-                        
-                        // Only calculate if we have a decent time delta (> 0.2s) to avoid division by zero spikes
-                        if (timeDiffSeconds > 0.2 && videoWidth > 0) {
-                            const fractionOfScreen = distPixels / videoWidth;
-                            const feetTraveled = fractionOfScreen * fieldWidthFt;
-                            const feetPerSecond = feetTraveled / timeDiffSeconds;
-                            speedMph = (feetPerSecond * 3600) / 5280;
-                            
-                            // Valid Sample? Push it.
-                            obj.speedSamples.push(speedMph);
+                        if (smoothSpeed > 0) {
+                            obj.speedSamples.push(smoothSpeed);
                             if (obj.speedSamples.length > 20) obj.speedSamples.shift();
                         }
+                        
+                        // 3. METRIC B: 0.5 Second Absolute Reading (Requested Robust Metric)
+                        const point5Sec = this.findHistoryPoint(obj.history, frameTime - 500, 100); 
+                        if (point5Sec) {
+                             obj.speedHalfSec = this.calculateSpeed(point5Sec, currentEnd, videoWidth, fieldWidthFt);
+                        } else {
+                            obj.speedHalfSec = null;
+                        }
 
-                        // 3. Update Current State
+                        // 4. METRIC C: 1.0 Second Absolute Reading (For Comparison)
+                        const point1Sec = this.findHistoryPoint(obj.history, frameTime - 1000, 100); 
+                        if (point1Sec) {
+                             obj.speed1Sec = this.calculateSpeed(point1Sec, currentEnd, videoWidth, fieldWidthFt);
+                        } else {
+                            obj.speed1Sec = null;
+                        }
+
+                        // 5. Update Position
                         obj.x = match.centerX;
                         obj.y = match.centerY;
                         obj.width = match.bbox[2];
@@ -161,6 +181,8 @@
                             lastSeen: frameTime,
                             history: [{ x: det.centerX, y: det.centerY, t: frameTime }],
                             speedSamples: [],
+                            speedHalfSec: null, // New 0.5s field
+                            speed1Sec: null,    // 1.0s field
                             missingFrames: 0,
                             class: det.class,
                             locked: false, 
@@ -228,7 +250,9 @@
                             };
                         }
                     } catch (e) {
-                        alert("Could not access camera. Ensure you are on HTTPS.");
+                        // Use a custom message box instead of alert()
+                        console.error("Camera access failed:", e);
+                        setLogs(prev => [{id: -1, time: new Date().toLocaleTimeString(), class: 'System', speed: 'Error', speedHalfSec: 'Camera access denied.', speed1s: ''}, ...prev]);
                     }
                 }
             };
@@ -251,8 +275,17 @@
 
             const downloadCSV = () => {
                 if (logs.length === 0) return;
-                const headers = ["ID", "Time", "Class", "Speed (MPH)"];
-                const rows = logs.map(log => [log.id, log.time, log.class, log.speed]);
+                const headers = ["ID", "Time", "Class", "Smoothed Speed (MPH)", "0.5s-Avg (MPH)", "1s-Avg (MPH)"]; // Updated headers
+                
+                const rows = logs.map(log => [
+                    log.id, 
+                    log.time, 
+                    log.class, 
+                    log.speed, 
+                    log.speedHalfSec || "-", // Use 0.5s avg
+                    log.speed1s || "-"      // Use 1s avg
+                ]);
+                
                 let csvContent = "data:text/csv;charset=utf-8," + headers.join(",") + "\n" + rows.map(e => e.join(",")).join("\n");
                 const encodedUri = encodeURI(csvContent);
                 const link = document.createElement("a");
@@ -269,6 +302,7 @@
                 const video = videoRef.current;
                 if (video.paused || video.ended) return;
 
+                // Reset tracker if video time jumps backwards significantly (e.g. user seeks)
                 if (video.currentTime < lastVideoTimeRef.current - 0.5) {
                     tracker.current.clearActiveObjects();
                 }
@@ -288,9 +322,11 @@
                 const timestamp = performance.now();
                 const trackedObjects = tracker.current.update(predictions, timestamp, fieldWidth, video.videoWidth, showDebug);
 
+                // 1. Draw Video Frame
                 ctx.clearRect(0, 0, canvas.width, canvas.height);
                 ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
                 
+                // 2. Draw Field Line/Label
                 ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
                 ctx.lineWidth = 2;
                 ctx.beginPath();
@@ -301,30 +337,49 @@
                 ctx.font = '14px sans-serif';
                 ctx.fillText(`◄―― Visual Field: ${fieldWidth} ft ――►`, canvas.width / 2 - 80, canvas.height - 30);
 
-                if (predictions.length === 0 && isProcessing) {
-                    ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
-                    ctx.fillRect(10, 10, 200, 30);
-                    ctx.fillStyle = 'white';
-                    ctx.font = '14px sans-serif';
-                    ctx.fillText("Scanning... (No objects)", 20, 30);
-                }
-
+                // 3. Draw Detections & Speed
                 trackedObjects.forEach(obj => {
+                    // Smoothed Speed (The main display)
                     const validSamples = obj.speedSamples.filter(s => s > 1 && s < 120); 
                     const avgSpeed = validSamples.length > 0 ? (validSamples.reduce((a, b) => a + b, 0) / validSamples.length).toFixed(1) : '...';
+                    
+                    // Specific interval speeds
+                    const speedHalfSec = obj.speedHalfSec ? obj.speedHalfSec.toFixed(1) : null;
+                    const speed1s = obj.speed1Sec ? obj.speed1Sec.toFixed(1) : null;
+                    
                     const opacity = 1 - (obj.missingFrames / 10);
                     const color = obj.locked ? '#00FF00' : (obj.missingFrames > 0 ? `rgba(255, 165, 0, ${opacity})` : `rgba(0, 255, 0, ${opacity})`);
 
+                    // Bounding Box
                     ctx.strokeStyle = color;
                     ctx.lineWidth = 3;
                     ctx.strokeRect(obj.x - obj.width / 2, obj.y - obj.height / 2, obj.width, obj.height);
 
+                    // Main Speed Label
                     ctx.fillStyle = color;
                     ctx.font = 'bold 24px monospace';
-                    // Always show Class now, not just in Debug
                     const label = `#${obj.id} ${obj.class} ${avgSpeed} mph`;
                     ctx.fillText(label, obj.x - obj.width / 2, obj.y - obj.height / 2 - 10);
+                    
+                    let yOffset = obj.y + obj.height / 2 + 20;
 
+                    // METRIC 2: 0.5s Average (The new preferred robust metric)
+                    if (speedHalfSec) {
+                         ctx.fillStyle = '#f97316'; // Orange
+                         ctx.font = 'bold 18px monospace';
+                         ctx.fillText(`0.5s Avg: ${speedHalfSec}`, obj.x - obj.width / 2, yOffset);
+                         yOffset += 25;
+                    }
+
+                    // METRIC 3: 1s Average (The longer, less robust metric)
+                    if (speed1s) {
+                         ctx.fillStyle = '#06b6d4'; // Cyan
+                         ctx.font = 'bold 18px monospace';
+                         ctx.fillText(`1s Avg: ${speed1s}`, obj.x - obj.width / 2, yOffset);
+                    }
+
+
+                    // Logging/Locking Logic
                     if (obj.locked) {
                         ctx.fillStyle = '#00FF00';
                         ctx.fillRect(obj.x - obj.width/2, obj.y - obj.height/2 - 35, 80, 25);
@@ -338,6 +393,8 @@
                         setLogs(prev => [{
                             id: obj.id,
                             speed: avgSpeed,
+                            speedHalfSec: speedHalfSec, // Capture the 0.5s speed at lock time
+                            speed1s: speed1s,           // Capture the 1s speed at lock time
                             class: obj.class,
                             time: new Date().toLocaleTimeString()
                         }, ...prev]);
@@ -358,7 +415,9 @@
                         setIsProcessing(true);
                         requestRef.current = requestAnimationFrame(detectFrame);
                     } catch (err) {
-                        alert("Video play error: " + err.message);
+                         // Use console error instead of alert
+                        console.error("Video play error:", err);
+                        setLogs(prev => [{id: -1, time: new Date().toLocaleTimeString(), class: 'System', speed: 'Error', speedHalfSec: 'Cannot play video.', speed1s: ''}, ...prev]);
                     }
                 }
             };
@@ -432,7 +491,12 @@
                                 ) : (
                                     <table className="w-full text-sm text-left">
                                         <thead>
-                                            <tr className="text-gray-500 border-b border-slate-800"><th className="pb-1">Time</th><th className="pb-1">ID</th><th className="pb-1">Type</th><th className="pb-1 text-right">Speed</th></tr>
+                                            <tr className="text-gray-500 border-b border-slate-800">
+                                                <th className="pb-1">Time</th>
+                                                <th className="pb-1">ID</th>
+                                                <th className="pb-1">Type</th>
+                                                <th className="pb-1 text-right">Smooth</th>
+                                            </tr>
                                         </thead>
                                         <tbody>
                                             {logs.map((log, i) => (
@@ -440,7 +504,11 @@
                                                     <td className="py-2 text-gray-400">{log.time}</td>
                                                     <td className="py-2 text-blue-400 font-mono">#{log.id}</td>
                                                     <td className="py-2">{log.class}</td>
-                                                    <td className="py-2 text-right font-bold text-green-400">{log.speed}</td>
+                                                    <td className="py-2 text-right font-bold text-green-400">
+                                                        {log.speed}
+                                                        <span className="text-xs text-orange-400 block">0.5s: {log.speedHalfSec || '-'}</span>
+                                                        <span className="text-xs text-cyan-400 block">1.0s: {log.speed1s || '-'}</span>
+                                                    </td>
                                                 </tr>
                                             ))}
                                         </tbody>
